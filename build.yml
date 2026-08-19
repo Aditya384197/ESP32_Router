@@ -1,0 +1,30 @@
+name: Build ESP32 NAT Router
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with ESP-IDF 5.1.2
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.1.2
+          target: esp32
+          command: |
+            set -euo pipefail
+            idf.py set-target esp32
+            idf.py build
+            test -f build/esp32_nat_router_performance.bin
+            test -f build/bootloader/bootloader.bin
+            test -f build/partition_table/partition-table.bin
+            test -f build/ota_data_initial.bin
+            size=$(stat -c%s build/esp32_nat_router_performance.bin)
+            test "$size" -le 1572864
+            echo "Firmware size: ${size} bytes (OTA limit: 1572864 bytes)"

@@ -1,0 +1,8 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Keep the proven Martin Ger ESP32 flash map; the application fits in the 1536K OTA slots.
+nvs,      data, nvs,     0x9000,  24K,
+otadata,  data, ota,     0xF000,  8K,
+phy_init, data, phy,     0x11000, 4K,
+ota_0,    app,  ota_0,   0x20000, 1536K,
+ota_1,    app,  ota_1,   ,        1536K,
+storage,  data, fat,     ,        320K,
