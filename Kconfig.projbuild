@@ -1,0 +1,2 @@
+# No project-specific Kconfig options.
+# Runtime management values are intentionally fixed for this performance build.
