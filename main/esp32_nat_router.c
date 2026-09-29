@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -60,6 +61,12 @@
 #define HEALTH_FAIL_RECONNECT 4     /* 4 failed rounds  (~80 s)  -> reconnect uplink */
 #define HEALTH_FAIL_REBOOT    12    /* 12 failed rounds (~4 min) -> reboot            */
 #define NO_UPLINK_REBOOT_S    900   /* configured uplink absent for 15 min -> reboot  */
+
+/* Channel width experiment switch: 0 = driver default, 1 = force HT20, 2 = force HT40.
+ * Measure with iperf/speedtest before changing; wider is faster only if the uplink
+ * router itself runs 40 MHz on its channel. */
+#define ROUTER_BANDWIDTH     0
+#define LOW_HEAP_BYTES       16384  /* free heap below this for 3 checks in a row -> reboot */
 
 #define DHCPS_OFFER_DNS      0x02   /* same value as lwIP OFFER_DNS */
 #define MAX_BODY             1024
@@ -200,6 +207,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        (void)ev;
         s_sta_up = true;
         s_up_gen++;
         s_reconnect_ms = RECONNECT_INITIAL_MS;
@@ -306,6 +314,19 @@ static void wifi_bringup(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+
+    /* AP beacons/broadcasts at OFDM 6 Mbps instead of 11b 1 Mbps: less airtime wasted.
+     * (Only pure 802.11b clients are affected; none exist today.) */
+    (void)esp_wifi_config_11b_rate(WIFI_IF_AP, true);
+
+#if ROUTER_BANDWIDTH == 1
+    (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+    (void)esp_wifi_set_bandwidth(WIFI_IF_AP,  WIFI_BW_HT20);
+#elif ROUTER_BANDWIDTH == 2
+    (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    (void)esp_wifi_set_bandwidth(WIFI_IF_AP,  WIFI_BW_HT40);
+#endif
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* Always-on radio: lowest latency, highest throughput. */
@@ -323,6 +344,7 @@ static void ping_end_cb(esp_ping_handle_t hdl, void *args)
     (void)esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &recv, sizeof(recv));
     s_ping_recv = recv;
     s_ping_done = true;
+    (void)esp_ping_delete_session(hdl);
 }
 
 /* true = gateway answered (or test not possible), false = 3/3 lost */
@@ -357,14 +379,8 @@ static bool gateway_alive(void)
     for (int i = 0; i < 100 && !s_ping_done; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    if (!s_ping_done) {
-        /* Timed out: clean up the session before declaring the test inconclusive. */
-        (void)esp_ping_delete_session(h);
-        return true;      /* inconclusive: do not act */
-    }
-    bool alive = s_ping_recv > 0;
-    (void)esp_ping_delete_session(h);
-    return alive;
+    if (!s_ping_done) return true;      /* inconclusive: do not act */
+    return s_ping_recv > 0;
 }
 
 static void health_task(void *arg)
@@ -373,9 +389,19 @@ static void health_task(void *arg)
     uint32_t gen = 0;
     int fails = 0;
     bool armed = false;   /* only act on ping failures after the gateway answered once */
+    int low_heap = 0;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(HEALTH_PERIOD_S * 1000));
+
+        if (esp_get_free_heap_size() < LOW_HEAP_BYTES) {
+            if (++low_heap >= 3) {
+                ESP_LOGE(TAG, "heap exhausted, rebooting");
+                esp_restart();
+            }
+        } else {
+            low_heap = 0;
+        }
 
         if (s_cfg.sta_ssid[0] == '\0') continue;
 
@@ -521,56 +547,87 @@ static const char PAGE_HEAD[] =
     "input[type=checkbox]{width:auto;margin:0 6px 0 0}"
     "button{width:100%;padding:12px;font-size:16px}"
     "fieldset{margin-bottom:14px}.s{color:#444;font-size:14px}"
-    "#rssi.good{color:#087f23}#rssi.mid{color:#9a6700}#rssi.bad{color:#b42318}"
     "</style></head><body><h2>ESP32 Router</h2>";
+
+/* Live uplink signal report. RSSI is measured by the radio; the distance is a
+ * log-distance path-loss estimate (1 m reference -40 dBm, exponent 3.0 indoors),
+ * so treat it as a rough guide - walls and furniture change it. */
+static void build_status(char *buf, size_t cap)
+{
+    char sig[640];
+    esp_netif_ip_info_t ip;
+    wifi_ap_record_t rec;
+    wifi_sta_list_t list;
+    int clients = 0;
+
+    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
+
+    if (!s_cfg.sta_ssid[0]) {
+        snprintf(sig, sizeof(sig), "<p><b>Uplink: not configured</b></p>");
+    } else if (s_sta_up &&
+               esp_wifi_sta_get_ap_info(&rec) == ESP_OK &&
+               esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK) {
+        int rssi = rec.rssi;
+        const char *q, *hint, *col;
+        if (rssi >= -50)      { q = "Excellent (बहुत बढ़िया)"; hint = "Best possible spot."; col = "#1a9a1a"; }
+        else if (rssi >= -60) { q = "Very good (बहुत अच्छा)";  hint = "Full speed expected."; col = "#1a9a1a"; }
+        else if (rssi >= -67) { q = "Good (अच्छा)";            hint = "Good for high speed."; col = "#5aa000"; }
+        else if (rssi >= -75) { q = "Fair (ठीक-ठाक)";          hint = "Speed will drop. Move closer to the uplink router."; col = "#e09000"; }
+        else if (rssi >= -85) { q = "Poor (कमज़ोर)";           hint = "Unstable. Move much closer to the uplink router."; col = "#d05000"; }
+        else                  { q = "Very bad (बहुत ख़राब)";    hint = "Will disconnect. Move much closer."; col = "#c00000"; }
+
+        int pct = (rssi + 100) * 100 / 60;
+        if (pct < 3) pct = 3;
+        if (pct > 100) pct = 100;
+
+        float d = powf(10.0f, (float)(-40 - rssi) / 30.0f);
+        char dist[24];
+        if (d < 1.0f) {
+            strlcpy(dist, "&lt; 1 m", sizeof(dist));
+        } else if (d > 100.0f) {
+            strlcpy(dist, "&gt; 100 m", sizeof(dist));
+        } else if (d < 10.0f) {
+            int dm = (int)(d * 10.0f + 0.5f);
+            snprintf(dist, sizeof(dist), "%d.%d m", dm / 10, dm % 10);
+        } else {
+            snprintf(dist, sizeof(dist), "%d m", (int)(d + 0.5f));
+        }
+
+        snprintf(sig, sizeof(sig),
+                 "<p class=\"s\">Uplink: <b>connected</b> &middot; " IPSTR " &middot; channel %d</p>"
+                 "<div style=\"background:#ddd;border-radius:6px;height:14px\">"
+                 "<div style=\"height:14px;border-radius:6px;width:%d%%;background:%s\"></div></div>"
+                 "<p><b>Signal: %d dBm &ndash; %s</b><br>%s<br>"
+                 "Approx. distance to uplink router: ~%s (rough estimate)</p>",
+                 IP2STR(&ip.ip), (int)rec.primary, pct, col, rssi, q, hint, dist);
+    } else {
+        snprintf(sig, sizeof(sig), "<p><b>Uplink: connecting...</b></p>");
+    }
+
+    snprintf(buf, cap,
+             "%s<p class=\"s\">Clients: %d &middot; Uptime: %llu s<br>"
+             "Free heap: %lu (min %lu)</p>",
+             sig, clients,
+             (unsigned long long)(esp_timer_get_time() / 1000000LL),
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size());
+}
 
 static esp_err_t status_get(httpd_req_t *req)
 {
-    wifi_ap_record_t rec;
-    int rssi = 0;
-    int channel = 0;
-    bool connected = s_sta_up && esp_wifi_sta_get_ap_info(&rec) == ESP_OK;
-    if (connected) {
-        rssi = rec.rssi;
-        channel = rec.primary;
-    }
-
-    httpd_resp_set_type(req, "application/json");
+    char frag[900];
+    build_status(frag, sizeof(frag));
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    wifi_sta_list_t list;
-    unsigned clients = 0;
-    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
-
-    char json[320];
-    snprintf(json, sizeof(json),
-             "{\"connected\":%s,\"rssi\":%d,\"channel\":%d,\"clients\":%u,\"heap\":%lu}",
-             connected ? "true" : "false", rssi, channel, clients,
-             (unsigned long)esp_get_free_heap_size());
-    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, frag, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t root_get(httpd_req_t *req)
 {
-    char up[112];
-    char line[520];
+    char frag[900];
     char e_ss[400], e_sp[400], e_as[400], e_ap[400];
-    esp_netif_ip_info_t ip;
-    wifi_ap_record_t rec;
-    int rssi = 0;
-    int channel = 0;
-    if (esp_wifi_sta_get_ap_info(&rec) == ESP_OK) {
-        rssi = rec.rssi;
-        channel = rec.primary;
-    }
 
-    if (!s_cfg.sta_ssid[0]) {
-        strlcpy(up, "not configured", sizeof(up));
-    } else if (s_sta_up && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK) {
-        snprintf(up, sizeof(up), "connected &middot; " IPSTR, IP2STR(&ip.ip));
-    } else {
-        strlcpy(up, "connecting...", sizeof(up));
-    }
-
+    build_status(frag, sizeof(frag));
     html_esc(s_cfg.sta_ssid, e_ss, sizeof(e_ss));
     html_esc(s_cfg.sta_pass, e_sp, sizeof(e_sp));
     html_esc(s_cfg.ap_ssid,  e_as, sizeof(e_as));
@@ -579,36 +636,9 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_sendstr_chunk(req, PAGE_HEAD);
-
-    char rssi_text[32];
-    char channel_text[16];
-    snprintf(rssi_text, sizeof(rssi_text), "%s", rssi ? "" : "--");
-    snprintf(channel_text, sizeof(channel_text), "%s", channel ? "" : "--");
-    if (rssi) snprintf(rssi_text, sizeof(rssi_text), "%d dBm", rssi);
-    if (channel) snprintf(channel_text, sizeof(channel_text), "%d", channel);
-
-    wifi_sta_list_t list;
-    unsigned clients = 0;
-    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
-
-    snprintf(line, sizeof(line),
-             "<p class=\"s\">Uplink: <b>%s</b>"
-             "<br>Signal: <b id=\"rssi\">%s</b> &middot; Channel: <span id=\"channel\">%s</span>"
-             "<br>Clients: <span id=\"clients\">%u</span> &middot; Uptime: %llu s"
-             "<br>Free heap: <span id=\"heap\">%lu</span> (min %lu)</p>"
-             "<script>async function stat(){try{let r=await fetch('/api/status',{cache:'no-store'});"
-             "let x=await r.json(),e=document.getElementById('rssi');"
-             "e.textContent=x.connected?(x.rssi+' dBm'):'--';"
-             "e.className=!x.connected?'':(x.rssi>=-60?'good':(x.rssi>=-72?'mid':'bad'));"
-             "document.getElementById('channel').textContent=x.connected?x.channel:'--';"
-             "document.getElementById('clients').textContent=x.clients;"
-             "document.getElementById('heap').textContent=x.heap;"
-             "}catch(e){}}stat();setInterval(stat,5000);</script>",
-             up, rssi_text, channel_text, clients,
-             (unsigned long long)(esp_timer_get_time() / 1000000LL),
-             (unsigned long)esp_get_free_heap_size(),
-             (unsigned long)esp_get_minimum_free_heap_size());
-    httpd_resp_sendstr_chunk(req, line);
+    httpd_resp_sendstr_chunk(req, "<div id=\"st\">");
+    httpd_resp_sendstr_chunk(req, frag);
+    httpd_resp_sendstr_chunk(req, "</div>");
 
     httpd_resp_sendstr_chunk(req,
         "<form method=\"post\" action=\"/save\">"
@@ -633,7 +663,10 @@ static esp_err_t root_get(httpd_req_t *req)
         "<label><input type=\"checkbox\" onclick=\"var t=this.checked?'text':'password';"
         "var a=document.querySelectorAll('.pw');for(var i=0;i<a.length;i++)a[i].type=t\">"
         "Show passwords</label><br><br>"
-        "<button type=\"submit\">Save &amp; restart</button></form></body></html>");
+        "<button type=\"submit\">Save &amp; restart</button></form>"
+        "<script>setInterval(function(){fetch('/status').then(function(r){return r.text()})"
+        ".then(function(t){document.getElementById('st').innerHTML=t}).catch(function(){})},2000)"
+        "</script></body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
@@ -698,7 +731,7 @@ static esp_err_t save_post(httpd_req_t *req)
 static void web_start(void)
 {
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
-    hc.stack_size = 6144;
+    hc.stack_size = 8192;
     hc.max_open_sockets = 4;
     hc.lru_purge_enable = true;
     hc.recv_wait_timeout = 5;
@@ -710,11 +743,11 @@ static void web_start(void)
         ESP_LOGE(TAG, "web server start failed");
         return;
     }
-    httpd_uri_t root = { .uri = "/",          .method = HTTP_GET,  .handler = root_get,   .user_ctx = NULL };
-    httpd_uri_t api  = { .uri = "/api/status", .method = HTTP_GET,  .handler = status_get, .user_ctx = NULL };
-    httpd_uri_t save = { .uri = "/save",      .method = HTTP_POST, .handler = save_post,  .user_ctx = NULL };
+    httpd_uri_t root = { .uri = "/",     .method = HTTP_GET,  .handler = root_get,  .user_ctx = NULL };
+    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post, .user_ctx = NULL };
+    httpd_uri_t stat = { .uri = "/status", .method = HTTP_GET, .handler = status_get, .user_ctx = NULL };
     httpd_register_uri_handler(srv, &root);
-    httpd_register_uri_handler(srv, &api);
+    httpd_register_uri_handler(srv, &stat);
     httpd_register_uri_handler(srv, &save);
 }
 
