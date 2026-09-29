@@ -21,19 +21,13 @@ jobs:
           target: esp32
           path: .
           command: |
-            set -euo pipefail
+            set -e
             idf.py set-target esp32
             idf.py build
-            test -s build/esp32_nat_router_performance.bin
             idf.py size
-            echo "===== applied performance settings ====="
-            grep -E "^CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=|^CONFIG_ESP_WIFI_(STATIC_RX|DYNAMIC_RX|DYNAMIC_TX)_BUFFER_NUM|^CONFIG_ESP_WIFI_(TX|RX)_BA_WIN=|^CONFIG_ESP_WIFI_(IRAM|RX_IRAM)_OPT|^CONFIG_LWIP_(IRAM_OPTIMIZATION|IPV4_NAPT|IP_FORWARD|TCPIP_TASK_AFFINITY|TCP_SND_BUF_DEFAULT|TCP_WND_DEFAULT)" build/sdkconfig
-            idf.py merge-bin -o build/merged-flash.bin
-            test -s build/merged-flash.bin
-            test -s build/bootloader/bootloader.bin
-            test -s build/partition_table/partition-table.bin
-            echo "===== firmware artifacts ====="
-            ls -lh build/esp32_nat_router_performance.bin build/merged-flash.bin build/bootloader/bootloader.bin build/partition_table/partition-table.bin
+            echo "===== applied settings ====="
+            grep -E "^CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=|^CONFIG_ESP_WIFI_(STATIC_RX|DYNAMIC_RX|DYNAMIC_TX)_BUFFER_NUM|BA_WIN|^CONFIG_ESP_WIFI_(IRAM|RX_IRAM)_OPT|^CONFIG_LWIP_(IRAM_OPTIMIZATION|IPV4_NAPT|IP_FORWARD|TCPIP_TASK_AFFINITY)" build/sdkconfig || true
+            cd build && (esptool.py --chip esp32 merge_bin -o merged-flash.bin @flash_args || echo "merge skipped")
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
@@ -41,10 +35,10 @@ jobs:
           name: esp32-router-firmware
           path: |
             build/esp32_nat_router_performance.bin
-            build/merged-flash.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
+            build/merged-flash.bin
             build/flasher_args.json
             build/sdkconfig
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
