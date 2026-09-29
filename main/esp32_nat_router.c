@@ -323,7 +323,6 @@ static void ping_end_cb(esp_ping_handle_t hdl, void *args)
     (void)esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &recv, sizeof(recv));
     s_ping_recv = recv;
     s_ping_done = true;
-    (void)esp_ping_delete_session(hdl);
 }
 
 /* true = gateway answered (or test not possible), false = 3/3 lost */
@@ -351,15 +350,21 @@ static bool gateway_alive(void)
     s_ping_recv = 0;
     esp_ping_handle_t h = NULL;
     if (esp_ping_new_session(&pc, &cbs, &h) != ESP_OK) return true;
-    if (esp_ping_start_session(h) != ESP_OK) {
+    if (esp_ping_start(h) != ESP_OK) {
         (void)esp_ping_delete_session(h);
         return true;
     }
     for (int i = 0; i < 100 && !s_ping_done; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    if (!s_ping_done) return true;      /* inconclusive: do not act */
-    return s_ping_recv > 0;
+    if (!s_ping_done) {
+        /* Timed out: clean up the session before declaring the test inconclusive. */
+        (void)esp_ping_delete_session(h);
+        return true;      /* inconclusive: do not act */
+    }
+    bool alive = s_ping_recv > 0;
+    (void)esp_ping_delete_session(h);
+    return alive;
 }
 
 static void health_task(void *arg)
@@ -516,27 +521,52 @@ static const char PAGE_HEAD[] =
     "input[type=checkbox]{width:auto;margin:0 6px 0 0}"
     "button{width:100%;padding:12px;font-size:16px}"
     "fieldset{margin-bottom:14px}.s{color:#444;font-size:14px}"
+    "#rssi.good{color:#087f23}#rssi.mid{color:#9a6700}#rssi.bad{color:#b42318}"
     "</style></head><body><h2>ESP32 Router</h2>";
+
+static esp_err_t status_get(httpd_req_t *req)
+{
+    wifi_ap_record_t rec;
+    int rssi = 0;
+    int channel = 0;
+    bool connected = s_sta_up && esp_wifi_sta_get_ap_info(&rec) == ESP_OK;
+    if (connected) {
+        rssi = rec.rssi;
+        channel = rec.primary;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    wifi_sta_list_t list;
+    unsigned clients = 0;
+    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
+
+    char json[320];
+    snprintf(json, sizeof(json),
+             "{\"connected\":%s,\"rssi\":%d,\"channel\":%d,\"clients\":%u,\"heap\":%lu}",
+             connected ? "true" : "false", rssi, channel, clients,
+             (unsigned long)esp_get_free_heap_size());
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
 
 static esp_err_t root_get(httpd_req_t *req)
 {
     char up[112];
-    char line[320];
+    char line[520];
     char e_ss[400], e_sp[400], e_as[400], e_ap[400];
     esp_netif_ip_info_t ip;
     wifi_ap_record_t rec;
-    wifi_sta_list_t list;
-    int clients = 0;
-
-    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
+    int rssi = 0;
+    int channel = 0;
+    if (esp_wifi_sta_get_ap_info(&rec) == ESP_OK) {
+        rssi = rec.rssi;
+        channel = rec.primary;
+    }
 
     if (!s_cfg.sta_ssid[0]) {
         strlcpy(up, "not configured", sizeof(up));
     } else if (s_sta_up && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK) {
-        int rssi = 0;
-        if (esp_wifi_sta_get_ap_info(&rec) == ESP_OK) rssi = rec.rssi;
-        snprintf(up, sizeof(up), "connected &middot; " IPSTR " &middot; %d dBm",
-                 IP2STR(&ip.ip), rssi);
+        snprintf(up, sizeof(up), "connected &middot; " IPSTR, IP2STR(&ip.ip));
     } else {
         strlcpy(up, "connecting...", sizeof(up));
     }
@@ -550,10 +580,31 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_sendstr_chunk(req, PAGE_HEAD);
 
+    char rssi_text[32];
+    char channel_text[16];
+    snprintf(rssi_text, sizeof(rssi_text), "%s", rssi ? "" : "--");
+    snprintf(channel_text, sizeof(channel_text), "%s", channel ? "" : "--");
+    if (rssi) snprintf(rssi_text, sizeof(rssi_text), "%d dBm", rssi);
+    if (channel) snprintf(channel_text, sizeof(channel_text), "%d", channel);
+
+    wifi_sta_list_t list;
+    unsigned clients = 0;
+    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) clients = list.num;
+
     snprintf(line, sizeof(line),
-             "<p class=\"s\">Uplink: <b>%s</b><br>Clients: %d &middot; Uptime: %llu s"
-             "<br>Free heap: %lu (min %lu)</p>",
-             up, clients,
+             "<p class=\"s\">Uplink: <b>%s</b>"
+             "<br>Signal: <b id=\"rssi\">%s</b> &middot; Channel: <span id=\"channel\">%s</span>"
+             "<br>Clients: <span id=\"clients\">%u</span> &middot; Uptime: %llu s"
+             "<br>Free heap: <span id=\"heap\">%lu</span> (min %lu)</p>"
+             "<script>async function stat(){try{let r=await fetch('/api/status',{cache:'no-store'});"
+             "let x=await r.json(),e=document.getElementById('rssi');"
+             "e.textContent=x.connected?(x.rssi+' dBm'):'--';"
+             "e.className=!x.connected?'':(x.rssi>=-60?'good':(x.rssi>=-72?'mid':'bad'));"
+             "document.getElementById('channel').textContent=x.connected?x.channel:'--';"
+             "document.getElementById('clients').textContent=x.clients;"
+             "document.getElementById('heap').textContent=x.heap;"
+             "}catch(e){}}stat();setInterval(stat,5000);</script>",
+             up, rssi_text, channel_text, clients,
              (unsigned long long)(esp_timer_get_time() / 1000000LL),
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)esp_get_minimum_free_heap_size());
@@ -659,9 +710,11 @@ static void web_start(void)
         ESP_LOGE(TAG, "web server start failed");
         return;
     }
-    httpd_uri_t root = { .uri = "/",     .method = HTTP_GET,  .handler = root_get,  .user_ctx = NULL };
-    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post, .user_ctx = NULL };
+    httpd_uri_t root = { .uri = "/",          .method = HTTP_GET,  .handler = root_get,   .user_ctx = NULL };
+    httpd_uri_t api  = { .uri = "/api/status", .method = HTTP_GET,  .handler = status_get, .user_ctx = NULL };
+    httpd_uri_t save = { .uri = "/save",      .method = HTTP_POST, .handler = save_post,  .user_ctx = NULL };
     httpd_register_uri_handler(srv, &root);
+    httpd_register_uri_handler(srv, &api);
     httpd_register_uri_handler(srv, &save);
 }
 
